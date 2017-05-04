@@ -1,0 +1,201 @@
+#!/usr/bin/python
+
+from collections import defaultdict
+import json
+import sqlite3
+
+import click
+
+
+# From the Anki schema; reordered `usn` within `cards` for convenience.
+revlog_cols = 'id cid usn ease ivl lastIvl factor time type'.split()
+cards_cols = 'id nid usn did ord mod type queue due ivl factor reps lapses left odue odid flags data'.split()
+
+
+from_mid = 1455531004306  # "Kanji - Heisig order (new edition)"
+to_mid = 1458405833105  # "Remembering the Kanji writings"
+
+
+def sql_list(items):
+    '''NB does not escape!'''
+    return ', '.join(items)
+
+
+def sql_plist(items):
+    '''NB does not escape!'''
+    return '(%s)' % (sql_list(items),)
+
+
+def count_stuff(cur):
+    notecounts = defaultdict(int,
+        {mid: c for mid, c in
+         cur.execute('select mid, count(*) from notes where mid in (?, ?) group by mid',
+                     (from_mid, to_mid))})
+    cardcounts = defaultdict(int,
+        {mid: c for mid, c in
+         cur.execute('''select mid, count(*) from cards, notes
+                        where nid = notes.id and mid in (?, ?) group by mid''',
+                     (from_mid, to_mid))})
+    revlogcounts = defaultdict(int,
+        {mid: c for mid, c in
+         cur.execute('''select mid, count(*) from revlog, cards, notes
+                        where cid = cards.id and nid = notes.id
+                          and mid in (?, ?) group by mid''',
+                     (from_mid, to_mid))})
+    return notecounts, cardcounts, revlogcounts
+
+
+@click.command()
+@click.argument('collection')
+def main(collection):
+    '''Migrate history from one RTK-correlated deck to a better one.
+
+    Your collection is assumed to have a deck with the structure of
+    this one: https://ankiweb.net/shared/info/1862058740 and you want
+    to switch to this one: https://ankiweb.net/shared/info/1999412794
+    preserving all study history.
+
+    This script will (a) identify which new-model cards correspond to
+    which old-model cards by RTK frame number; (b) synthesize
+    learn/review history records ("revlogs" in the Anki schema) for
+    the new-model cards just like those for the corresponding old
+    cards; (c) update the study metadata (due date, ease, etc.) on the
+    new-model cards likewise.
+    '''
+
+    cxn = sqlite3.connect(collection)
+    cur = cxn.cursor()
+
+    models = json.loads(list(cur.execute('select models from col'))[0][0])
+    from_model = models.get(str(from_mid))
+    to_model = models.get(str(to_mid))
+    if from_model is None:
+        raise click.ClickException('Note model %d (the "from" model) not present!'
+                                   % (from_mid,))
+    if to_model is None:
+        raise click.ClickException('Note model %d (the "to" model) not present!'
+                                   % (to_mid,))
+    if 'rtk index' not in from_model['flds'][-1]['name'].lower():
+        raise click.ClickException('''\
+Old note model has field %r where RTK frame number expected.
+This script is simple-minded and just looks in the one place, but
+does try to corroborate by checking the field name, and that name
+doesn't sound right.
+        ''' % (from_model['flds'][-1]['name']))
+    if (to_model['sortf'] != 0
+        or to_model['flds'][0]['name'] != 'frame'):
+        raise click.ClickException('''\
+New note model not as expected.
+This script is simple-minded; generalize it as needed.''')
+    
+    notecounts, cardcounts, revlogcounts = count_stuff(cur)
+    print '# Old-model notes/cards/revlogs: %d %d %d' % (
+        notecounts[from_mid], cardcounts[from_mid], revlogcounts[from_mid])
+    print '# New-model notes/cards/revlogs: %d %d %d' % (
+        notecounts[to_mid], cardcounts[to_mid], revlogcounts[to_mid])
+    
+    if revlogcounts[to_mid] != 0:
+        raise click.ClickException('''\
+History for new model already exists.
+
+This script isn't designed for this case.  Should it wipe out the
+existing history, or somehow complement it?  Think it through
+and edit the script accordingly before using.''')
+    
+    oldnid_by_frame = {}
+    frame_by_oldnid = {}
+    for nid, flds in cur.execute('select id, flds from notes where mid = ?',
+                                 (from_mid,)):
+        _, frame_id_str = flds.rsplit('\x1f', 1)
+        if not frame_id_str:
+            continue
+        frame_id = int(frame_id_str)
+        oldnid_by_frame[frame_id] = nid
+        frame_by_oldnid[nid] = frame_id
+    print '# Old notes with a frame ID: %d' % (len(oldnid_by_frame),)
+
+    newcid_by_frame = {}
+    for cid, sfld in cur.execute('''
+        select cards.id, sfld from cards, notes
+        where nid = notes.id and mid = ?''',
+                                 (to_mid,)):
+        newcid_by_frame[sfld] = cid
+    print '# New cards: %d' % (len(newcid_by_frame),)
+    if len(newcid_by_frame) != cardcounts[to_mid]:
+        raise click.ClickException('Mismatch ^')
+
+    skipped_revlogs = []
+    new_revlogs = []
+    for row in cur.execute('''
+            select nid, ''' + sql_list('revlog.' + c for c in revlog_cols) + '''
+            from revlog, cards, notes
+            where cid = cards.id and nid = notes.id and mid = ?''',
+                           (from_mid,)):
+        nid, revid, cid, usn = row[:4]
+        if nid not in frame_by_oldnid:
+            skipped_revlogs.append(row)
+            continue
+        newcid = newcid_by_frame[frame_by_oldnid[nid]]
+        new_revlogs.append((newcid, -1) + row[4:])
+    print '# History records on frameless cards: %d' % (len(skipped_revlogs),)
+    print 'Creating new history records (%d of them)...' % (len(new_revlogs),)
+    cur.executemany('insert into revlog %s values %s'
+                    % (sql_plist(revlog_cols[1:]), sql_plist(['?'] * len(revlog_cols[1:]))),
+                    new_revlogs)
+    # TODO: The `id` values we get will be autoincrements from the greatest existing value.
+    # The Anki behavior, by contrast, appears to be to make `id` a timestamp in
+    # epoch-ms.  Guess we should preserve the timestamps (add a ms or something)
+    # because that's the one record of when the individual reviews happened.
+
+    skipped_cards = []
+    cards_updates = []
+    for row in cur.execute('''
+            select ''' + sql_list('cards.' + c for c in cards_cols) + '''
+            from cards, notes
+            where nid = notes.id and mid = ?''',
+                           (from_mid,)):
+        cid, nid, usn = row[:3]
+        if nid not in frame_by_oldnid:
+            skipped_cards.append(row)
+            continue
+        newcid = newcid_by_frame[frame_by_oldnid[nid]]
+        cards_updates.append((-1,) + row[3:] + (newcid,))
+    print '# Frameless cards: %d' % (len(skipped_cards),)
+    print 'Updating cards (%d of them)...' % (len(cards_updates),)
+    cur.executemany('update cards set %s = %s where id = ?'
+                    % (sql_plist(cards_cols[2:]), sql_plist(['?'] * len(cards_cols[2:]))),
+                    cards_updates)
+    
+    notecounts, cardcounts, revlogcounts = count_stuff(cur)
+    print '# Old-model notes/cards/revlogs: %d %d %d' % (
+        notecounts[from_mid], cardcounts[from_mid], revlogcounts[from_mid])
+    print '# New-model notes/cards/revlogs: %d %d %d' % (
+        notecounts[to_mid], cardcounts[to_mid], revlogcounts[to_mid])
+
+    cxn.commit()
+    print 'Done!'
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+"""
+
+new card:
+nid->mid = NEW
+nid->sfld -> (n2.flds like X'251f' || n1.sfld)
+
+
+perl:
+make table old_nid frame
+then sqlite:
+with
+ cardmap as
+  (select newc.id as new_cid, oldc.* from cards as oldc, oldmap, notes as newn, cards as newc
+   where oldc.nid = oldmap.nid and oldmap.frame = newn.sfld and newn.id = newc.nid)
+update cards set type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data
+ = type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data
+ where id = cardmap.new_cid
+"""
