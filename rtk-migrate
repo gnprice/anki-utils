@@ -7,9 +7,16 @@ import sqlite3
 import click
 
 
-# From the Anki schema; reordered `usn` within `cards` for convenience.
+# From the Anki schema
 revlog_cols = 'id cid usn ease ivl lastIvl factor time type'.split()
-cards_cols = 'id nid usn did ord mod type queue due ivl factor reps lapses left odue odid flags data'.split()
+
+# Columns in `cards` in the Anki schema:
+#   id nid did ord mod usn type queue due ivl factor reps lapses left odue odid flags data
+# did is deck id, ord goes with nid; leave those unmodified
+# odue, odid are when in a filtered deck, flags, data unused; forbid those
+# type...left are learning status; copy those
+# copy mod, set usn
+cards_copy_cols = 'mod type queue due ivl factor reps lapses left'.split()
 
 
 from_mid = 1455531004306  # "Kanji - Heisig order (new edition)"
@@ -24,6 +31,10 @@ def sql_list(items):
 def sql_plist(items):
     '''NB does not escape!'''
     return '(%s)' % (sql_list(items),)
+
+
+def query_one_value(cur, *args):
+    return list(cur.execute(*args))[0][0]
 
 
 def count_stuff(cur):
@@ -101,7 +112,23 @@ History for new model already exists.
 This script isn't designed for this case.  Should it wipe out the
 existing history, or somehow complement it?  Think it through
 and edit the script accordingly before using.''')
-    
+
+    if list(cur.execute('''
+        select 1 from cards, notes where nid = notes.id and mid in (?, ?)
+                                     and (odue != 0 or odid != 0) limit 1''',
+                        (from_mid, to_mid))):
+        raise click.ClickException('''\
+One or more cards on old or new model is in a filtered deck.
+This case seems complicated and this script is too simple for it.
+Return them to their original decks.''')
+    if list(cur.execute('''
+        select 1 from cards, notes where nid = notes.id and mid in (?, ?)
+                                     and (cards.flags != 0 or cards.data != '') limit 1''',
+                        (from_mid, to_mid))):
+        raise click.ClickException('''\
+Some card has a nonempty `flags` or `data`!
+These are supposedly unused fields; unsure how to handle them.''')
+
     oldnid_by_frame = {}
     frame_by_oldnid = {}
     for nid, flds in cur.execute('select id, flds from notes where mid = ?',
@@ -113,6 +140,10 @@ and edit the script accordingly before using.''')
         oldnid_by_frame[frame_id] = nid
         frame_by_oldnid[nid] = frame_id
     print '# Old notes with a frame ID: %d' % (len(oldnid_by_frame),)
+    print '# Old cards with any study history: %d' % (query_one_value(cur, '''
+        select count(*) from cards, notes
+        where nid = notes.id and mid = ? and cards.type != 0''', (from_mid,)),)
+
 
     newcid_by_frame = {}
     for cid, sfld in cur.execute('''
@@ -149,21 +180,27 @@ and edit the script accordingly before using.''')
 
     skipped_cards = []
     cards_updates = []
+    cards_read_cols = ['id', 'nid'] + cards_copy_cols
+    cards_write_cols = ['usn'] + cards_copy_cols
     for row in cur.execute('''
-            select ''' + sql_list('cards.' + c for c in cards_cols) + '''
+            select ''' + sql_list('cards.' + c for c in cards_read_cols) + '''
             from cards, notes
             where nid = notes.id and mid = ?''',
                            (from_mid,)):
-        cid, nid, usn = row[:3]
+        cid, nid = row[:2]
         if nid not in frame_by_oldnid:
             skipped_cards.append(row)
             continue
+        if row[3] == 0: # type
+            # if never seen, no history; don't make noise bumping mod/usn
+            continue
         newcid = newcid_by_frame[frame_by_oldnid[nid]]
-        cards_updates.append((-1,) + row[3:] + (newcid,))
+        cards_updates.append((-1,) + row[2:] + (newcid,))
     print '# Frameless cards: %d' % (len(skipped_cards),)
     print 'Updating cards (%d of them)...' % (len(cards_updates),)
     cur.executemany('update cards set %s = %s where id = ?'
-                    % (sql_plist(cards_cols[2:]), sql_plist(['?'] * len(cards_cols[2:]))),
+                    % (sql_plist(cards_write_cols),
+                       sql_plist(['?'] * len(cards_write_cols))),
                     cards_updates)
     
     notecounts, cardcounts, revlogcounts = count_stuff(cur)
