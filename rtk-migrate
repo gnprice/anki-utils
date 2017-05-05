@@ -208,6 +208,9 @@ These are supposedly unused fields; unsure how to handle them.''')
     print '# New-model notes/cards/revlogs: %d %d %d' % (
         notecounts[to_mid], cardcounts[to_mid], revlogcounts[to_mid])
 
+    print 'Updating collection modtime...'
+    cur.execute('''update col set mod = (strftime('%s', 'now') + 1) * 1000''')
+
     cxn.commit()
     print 'Done!'
 
