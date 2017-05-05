@@ -167,16 +167,15 @@ These are supposedly unused fields; unsure how to handle them.''')
             skipped_revlogs.append(row)
             continue
         newcid = newcid_by_frame[frame_by_oldnid[nid]]
-        new_revlogs.append((newcid, -1) + row[4:])
+        # The `id` value in revlog is the timestamp of the learn/review,
+        # in epoch-ms.  We preserve the time information, just adding 1ms
+        # because as the primary key it needs to be distinct.
+        new_revlogs.append((revid+1, newcid, -1) + row[4:])
     print '# History records on frameless cards: %d' % (len(skipped_revlogs),)
     print 'Creating new history records (%d of them)...' % (len(new_revlogs),)
     cur.executemany('insert into revlog %s values %s'
-                    % (sql_plist(revlog_cols[1:]), sql_plist(['?'] * len(revlog_cols[1:]))),
+                    % (sql_plist(revlog_cols), sql_plist(['?'] * len(revlog_cols))),
                     new_revlogs)
-    # TODO: The `id` values we get will be autoincrements from the greatest existing value.
-    # The Anki behavior, by contrast, appears to be to make `id` a timestamp in
-    # epoch-ms.  Guess we should preserve the timestamps (add a ms or something)
-    # because that's the one record of when the individual reviews happened.
 
     skipped_cards = []
     cards_updates = []
